@@ -1,0 +1,205 @@
+﻿Param(
+[Parameter(Mandatory=$true)]
+[int]
+$Threshold
+)
+
+Import-Module activedirectory
+$pdce=(Get-ADDomainController -Discover -Service PrimaryDC).name 
+
+$Dom=[System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().name
+$rand = Get-Random -Minimum 1000 -Maximum 9999
+$st=get-date
+$tf= Get-Date -format M-d-yyyy_hhmmss
+$file=".\ADConvergenceResults_$tf.txt"
+"Start time = $st" | Out-File -FilePath $file
+"Domain Controller,Result,Time" | Out-File -FilePath $file -Append
+$etm=0
+
+$titleholder=Get-aduser -Identity Guest -Properties title -Server $pdce | select title
+$titleholder = $titleholder.title
+
+
+# Write to the Guest Title attribute on the PDCe
+# LookFor variable to use for looking for attribute replication
+# Get list of DCs in the domain
+set-aduser -Server $pdce -Identity Guest -Replace @{title="test_$rand"} 
+$LookFor = "test_$rand"
+$DCs = Get-ADDomainController -filter *
+
+#
+# Verify the file creation succeeded and if not exit
+$test_att = get-aduser -Server $pdce -Identity Guest -Properties title | select title
+$test_att = $test_att.title
+If ($test_att -eq $LookFor)
+{
+Write-host "`nUpdated the Guest's Title attribute with test_$rand on $pdce"
+
+    If ($titleholder -ne $null)
+    {
+        Write-host "The original value of the Guest's Title was $titleholder"
+    }
+    Else
+    {
+        Write-Host "The Guest's Title Attribute was empty"
+    }
+Write-host "Now waiting for replication"
+Write-Host "If a DC is offline or not responding, there will be about a 10 second delay waiting for that to time out"
+}
+Else
+{
+Write-host "`nUnable to modify the Guest's Title Attibute on $pdce"
+Write-Host "Exiting"
+Exit
+}
+
+#Get the start time and initialize hash table
+$t1=get-date
+$results2=@{}
+
+# Use hash table and use hashtable remove
+# Add and remove
+
+#Fill the first array to use in test-path
+$Results1 = $DCs | Group-Object -Property name -AsHashTable -AsString -NoElement 
+
+# x is used to exit if every DC gets the canary file 
+# If x gets to zero we can exit the loop before the threshold time
+
+$x= $results1.Keys | Measure-Object
+
+# This is the larger loop that will continue exit if one of two items are true:
+# x=0 or time running is greater than the threshold set when script started
+do
+{
+    foreach ($DC in $results1.keys)
+    {
+
+
+    Try{
+        $test_att = get-aduser -Server $DC -Identity Guest -Properties title -ErrorAction SilentlyContinue| select title 
+        $test_att = $test_att.title
+        }
+        Catch {
+        $test_att = $null
+        }
+        
+
+    If ($test_att -eq $LookFor)
+
+        {
+        write-host "Found test_$rand on Guest's Title Attribute on $DC" -background black -foreground green
+        $x.count--
+        # $t3 variable is here to have the last DC success time for the convergence time. It is overwritten every time
+        # a DC successfully replicates.  So the last success will be the actual convergence time.
+        $t3 = Get-Date 
+        # add converged member to csv file
+        "$DC,Success,$((Get-date)-$t1)" | Out-File -FilePath $file -Append
+        #
+        }
+        Else
+        {
+        Write-host “-----Waiting on $DC” -background black -foreground yellow 
+        Write-host " "
+        $results2.add($DC,$null)
+        }
+        
+     } 
+    
+    If ($x.count -gt 0)
+    { 
+        $t2 = get-date
+        $et = $t2 - $t1
+        Write-Host ""
+        $etm=[math]::round($et.TotalMinutes)
+        Write-host "Elapsed time is $etm minutes"
+        Write-host "Threshold is $threshold minutes"
+      
+        $results1 = $results2
+        $x = $Results1.keys | Measure-Object
+        $x1=$x.Count
+        $results2=@{}
+        $DC=$null
+        # This sleep is used to show an update and to give you time to see the screen.  
+        Write-Host "Waiting on $x1 Domain Controller(s)"
+        Write-host "Sleeping for a 3 seconds"
+        Start-sleep -seconds 3
+        Write-host "checking again"
+
+    }
+}
+until (($x.count -eq 0) -or ($etm -gt $Threshold))
+
+# Check to see if some DCs did not get the canary file based on x>0
+If ($x.count -gt 0)
+{
+Write-Host "These DCs did not replicate before the time out"
+$results1.keys
+
+# Add failed DCs to CSV file
+$tf=get-date
+foreach ($failed in $results1.keys)
+{
+"$failed,failed,$tf" | Out-File -FilePath $file -Append
+}
+
+}
+Else
+{
+# hoping we get this message
+Write-Host "Excellent - 100% success"
+$results1=@{}
+}
+
+# Calculating total convergence time
+#$t3 = Get-Date
+$ct = $t3-$t1
+write-host ""
+$ctm=$ct.TotalMinutes
+$ctm=[math]::Round($ctm,2)
+[int]$cts=$ct.TotalSeconds
+Write-host "Convergence was about $cts seconds"
+Write-host "Convergence was about $ctm minutes"
+
+
+# Reset Guest Attribute to original value
+
+If ($titleholder)
+{
+set-aduser -Server $pdce -Identity Guest -Replace @{title="$titleholder"} 
+}
+Else
+{
+set-aduser -Server $pdce -Identity Guest -clear Title 
+}
+
+
+
+
+$test_att = get-aduser -Server $pdce -Identity Guest -Properties title | select title
+$test_att = $test_att.title
+
+If ($test_att -ne $titleholder)
+{
+write-host "`nCould not restore Guest's Title Attribute to $titleholder on $pdce"
+Write-host "Please manually reset to $titleholder if needed"
+}
+else
+{
+write-host "The Guest's Title was restored to $TitleHolder on $pdce"
+}
+
+$i = $results1.Keys | measure-object
+$fcount=$i.count
+$ctm=[math]::round($ctm)
+"---,---,--- "| Out-File -FilePath $file -Append
+"Replication time on $t3 was about $ctm minutes" | Out-File -FilePath $file -Append
+Write-Host "See your results in $file"
+If ($fcount -gt 0)
+{
+"There were $fcount failure(s)" | Out-File -FilePath $file -Append
+}
+Else
+{
+"All Domain Controllers recieved the update to the Guest Account" | Out-File -FilePath $file -Append
+}
